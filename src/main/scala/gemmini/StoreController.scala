@@ -51,14 +51,7 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
     pool_stride := cmd.bits.cmd.rs2(39, 36)
     pool_window := cmd.bits.cmd.rs2(35, 32)
     out_width := cmd.bits.cmd.rs2(46, 40) // if pooling unable, use as valid rows
-    //    pool_en := cmd.bits.cmd.rs2(63)
-  }
-  /*
-  val pool_stride = cmd.bits.cmd.rs2(39, 36)
-  val pool_window = cmd.bits.cmd.rs2(35, 32)
-  val out_width = cmd.bits.cmd.rs2(45, 40)
-  val pool_en = cmd.bits.cmd.rs2(63)
-  */
+  } //pooling related parameters
 
   val mstatus = cmd.bits.cmd.status
 
@@ -94,7 +87,7 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
   val store_en = WireInit(false.B)
   dontTouch(store_en)
   val pool_first_row = RegInit(true.B)
-  val final_row = RegInit(false.B) //wire or register?
+  val final_row = RegInit(false.B)
   val counter = RegInit(0.U((2 * pool_row.getWidth).W))
   val block = RegInit(0.U((pool_row.getWidth).W))
 
@@ -105,7 +98,6 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
   // DMA IO wiring
   io.dma.req.valid := (control_state === waiting_for_command && cmd.valid && DoStore && cmd_tracker.io.alloc.ready) ||
     control_state === waiting_for_dma_req_ready || (control_state === sending_rows && counter =/= 0.U)
-  //    (control_state === sending_rows && row_counter =/= 0.U)
   io.dma.req.bits.vaddr := vaddr + row_counter * stride
   io.dma.req.bits.laddr := localaddr_plus_row_counter
   io.dma.req.bits.status := mstatus
@@ -126,10 +118,6 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
   io.completed.valid := cmd_tracker.io.cmd_completed.valid
   io.completed.bits := cmd_tracker.io.cmd_completed.bits.tag.rob_id
 
-  /*
-  io.completed.valid := false.B
-  io.completed.bits := cmd.bits.rob_id
-  */
 
   //Seah: implement pooling related features here
   // Row counter
@@ -146,7 +134,7 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
     //row_counter := wrappingAdd(row_counter, 1.U, block_rows)
     //wrapingAdd: add 1 to row_counter, return 0 when become equal to block_row
     //when(pool_en) {
-    when(pool_stride === 0.U) { //pool_stride = 0 means not do pooling
+    when(pool_stride === 0.U) { //pool_stride = 0  -> un-enable pooling
       pool_first_row := true.B
       store_en := true.B
       when(final_row){ //already have reached final unpadded row
@@ -157,7 +145,6 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
         round_row_counter := 0.U
         row_counter := 0.U
         pool_row := 0.U
-  //    }.elsewhen((counter + 1.U) % out_width === 0.U) {
       }.elsewhen((counter + 1.U) === out_width ) {
         final_row := true.B
       }.otherwise{
@@ -172,8 +159,8 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
      // row_counter := wrappingAdd(row_counter, 1.U, out_width)
     //counter := wrappingAdd(counter, 1.U, block_rows*5)//how?
     //    }.elsewhen(pool_row === block_rows.asUInt - 1.U) { //block_rows = 16
-  }.elsewhen(pool_row === out_width * out_width - 1.U) {
-    pool_first_row := true.B
+  }.elsewhen(pool_row === out_width * out_width - 1.U) { //when we finished pooling 1 output
+    pool_first_row := true.B 
     store_en := true.B //is it?
     pool_row := 0.U
       round_row_counter := 0.U
@@ -185,31 +172,31 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
     block := 0.U
       //final_row := true.B
   }.otherwise {
-    //when((counter + 1.U) % (pool_window * pool_window) === 0.U) { //one pool finished
-      when(round_counter + 1.U === (pool_window * pool_window)) { //one pool finished
+    //when((counter + 1.U) % (pool_window * pool_window) === 0.U) { //one pool window finished
+      when(round_counter + 1.U === (pool_window * pool_window)) { //changed due to modulo
         counter := counter + 1.U
         round_counter := round_counter - pool_window*pool_window + 1.U
         round_2_counter := round_2_counter - pool_window + 1.U
-        pool_first_row := true.B //register
+        pool_first_row := true.B //start new pooling window
         store_en := true.B //wire
         row_counter := row_counter + 1.U //increment row counter for next address (not this)
         //when((pool_row + 1.U) % out_width === 0.U) { //one whole output row pooling out is done
-        when(round_row_counter + pool_window === out_width) { //one whole output row pooling out is done
-          pool_row := pool_stride * (block + 1.U) * out_width //move on to next row block
+        when(round_row_counter + pool_window === out_width) { //changed due to modulo
+          pool_row := pool_stride * (block + 1.U) * out_width //move on to next row block (have to jump around)
           round_row_counter := 0.U
          when((1.U + counter) =/= 0.U) {
           block := block + 1.U
          }.otherwise {
           block := 0.U
          }
-        }.otherwise { // not done yet
+        }.otherwise { //in the middle of a output row
         //pool_row := pool_row - pool_window * pool_window + pool_stride - 1.U
-        pool_row := pool_row - (pool_window - 1.U) * out_width + pool_stride - pool_window + 1.U
+          pool_row := pool_row - (pool_window - 1.U) * out_width + pool_stride - pool_window + 1.U
           //round_row_counter := round_row_counter + pool_stride - pool_window + 1.U
           round_row_counter := round_row_counter + pool_stride
         }
-    //}.elsewhen((counter + 1.U) % pool_window === 0.U) { //reading one row finished
-      }.elsewhen(round_2_counter + 1.U === pool_window) {
+    //}.elsewhen((counter + 1.U) % pool_window === 0.U) { //reading one row inside pooling window finished
+      }.elsewhen(round_2_counter + 1.U === pool_window) { //changed due to modulo
         pool_row := pool_row + out_width - pool_window + 1.U
         //round_row_counter := round_row_counter + 1.U
         counter := counter + 1.U
@@ -217,7 +204,7 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
         round_counter := round_counter + 1.U
         pool_first_row := false.B
         store_en := false.B
-      }.otherwise {
+      }.otherwise { //still constructing one pooling row
         pool_first_row := false.B
         store_en := false.B
         counter := counter + 1.U
@@ -228,10 +215,6 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
       }
   }
 }
-
-  //io.dma.req.bits.store_en := store_en
-  //io.dma.req.bits.pool_first_row := pool_first_row
-
 
   // Control logic
   switch (control_state) {
@@ -253,7 +236,7 @@ class StoreController[T <: Data : Arithmetic](config: GemminiArrayConfig[T], cor
 
     is (sending_rows) {
       //val last_row = counter === 0.U || (row_counter === (block_rows-1).U && io.dma.req.fire())
-      val last_row = counter === 0.U || (row_counter === out_width*out_width - 1.U && io.dma.req.fire())
+      val last_row = counter === 0.U || (row_counter === out_width*out_width - 1.U && io.dma.req.fire()) //change number of output rows
 
       // io.completed.valid := last_row
 
