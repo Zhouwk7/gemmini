@@ -1,3 +1,4 @@
+/*
 package gemmini
 
 import chisel3._
@@ -10,26 +11,27 @@ import freechips.rocketchip.config.Parameters
 // TODO don't flush all 4 time steps when shorter flushes will work
 // TODO do we still need to flush when the dataflow is weight stationary? Won't the result just keep travelling through on its own?
 // TODO allow the matmul result to not be DIM-by-DIM, similar to how the matmul inputs can be padded if they aren't DIM-by-DIM
-class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: GemminiArrayConfig[T, U])
-                                             (implicit p: Parameters, ev: Arithmetic[T]) extends Module {
+class ExecuteController[T <: Data](xLen: Int, tagWidth: Int, config: GemminiArrayConfig[T])
+                                  (implicit p: Parameters, ev: Arithmetic[T]) extends Module {
   import config._
   import ev._
 
   val io = IO(new Bundle {
     val cmd = Flipped(Decoupled(new GemminiCmd(rob_entries)))
 
-    val im2col = new Bundle {
-      val req = Decoupled(new Im2ColReadReq(config))
-      val resp = Flipped(Decoupled(new Im2ColReadResp(config)))
-    }
-
     val srams = new Bundle {
       val read = Vec(sp_banks, new ScratchpadReadIO(sp_bank_entries, sp_width))
       val write = Vec(sp_banks, new ScratchpadWriteIO(sp_bank_entries, sp_width, (sp_width / (aligned_to * 8)) max 1))
     }
+
     val acc = new Bundle {
       val read = Vec(acc_banks, new AccumulatorReadIO(acc_bank_entries, log2Up(accType.getWidth), Vec(meshColumns, Vec(tileColumns, inputType))))
       val write = Vec(acc_banks, new AccumulatorWriteIO(acc_bank_entries, Vec(meshColumns, Vec(tileColumns, accType))))
+    }
+
+    val im2col = new Bundle {
+      val req = Decoupled(new Im2ColReadReq(config))
+      val resp = Flipped(Decoupled(new Im2ColReadResp(config)))
     }
 
     val completed = Valid(UInt(log2Up(rob_entries).W))
@@ -84,21 +86,12 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
     in_prop_flush := 0.U
   }
 
-  val ocol = RegInit(0.U(8.W))
-  val orow = RegInit(0.U(8.W))
-  val krow = RegInit(0.U(3.W))
+  val output_width = RegInit(0.U(10.W))
+  val weight_width = RegInit(0.U(4.W))
   val weight_stride = RegInit(0.U(3.W))
-  val channel = RegInit(0.U(7.W))
-  val row_turn = RegInit(0.U(11.W))
-  val row_left = RegInit(0.U(4.W))
-  val kdim2 = RegInit(0.U(6.W))
-
-  val icol = WireInit(0.U(9.W))
-  val irow = WireInit(0.U(9.W))
-
-  icol := ((ocol - 1.U) * weight_stride + krow)//.asSInt
-  irow := ((orow - 1.U) * weight_stride + krow)//.asSInt
-
+  val input_width = (output_width - 1.U) * weight_stride + weight_width //to save bitspace, input of output_dim instead
+  //val output_width = input_width - weight_width + 1.U
+  val channel = RegInit(0.U(10.W))
   val im2col_turn = WireInit(0.U(9.W))
   val channel_turn = WireInit(0.U(5.W))
 
@@ -108,11 +101,40 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
   val activation = Reg(UInt(2.W))
 
   //fix by input
-  val im2col_en = WireInit(false.B)
+  val im2col_en = RegInit(false.B)
+  val output_dim = output_width*output_width
 
-  //val row_turn_counter = RegInit(row_turn)
-  im2col_en := Mux(weight_stride === 0.U, false.B, true.B)
+  //Seah: added for more than 16 rows of output
+  val row_turn = Mux(output_dim(3,0) === 0.U, (output_dim >> 4.U).asUInt() - 1.U, (output_dim >> 4.U).asUInt())
 
+  val row_turn_counter = RegInit(row_turn)
+
+  /*
+  when(weight_width === 2.U){
+    channel_turn := 4.U
+  }.elsewhen(weight_width === 3.U || weight_width === 4.U){
+    channel_turn := 1.U
+  }.otherwise{channel_turn := 0.U} //from 5x5
+*/
+  when(channel === 1.U){
+    channel_turn := 16.U
+  }.elsewhen(channel === 2.U){
+    channel_turn := 8.U
+  }.elsewhen(channel === 3.U){
+    channel_turn := 5.U
+  }.elsewhen(channel === 4.U){
+    channel_turn := 4.U
+  }.elsewhen(channel === 5.U){
+    channel_turn := 3.U
+  }.elsewhen(channel >= 6.U && channel <= 8.U){
+    channel_turn := 2.U
+  }.otherwise{channel_turn := 1.U}
+
+  val im2col_width = weight_width * weight_width * channel
+  im2col_turn := (im2col_width >> (log2Up(block_size)).U).asUInt + 1.U
+  when(im2col_width(3,0) === 0.U){
+    im2col_turn := im2col_width >> (log2Up(block_size)).U
+  }
 
   // SRAM addresses of matmul operands
   val a_address_rs1 = rs1s(a_address_place).asTypeOf(local_addr_t)
@@ -167,6 +189,9 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
   mesh.io.pe_control.shift := cntl.shift
   mesh.io.flush.bits := 0.U
 
+  //Seah: added for WS accumulator prop disenable
+  val prop = WireInit(false.B)
+  val prop_lock = RegInit(false.B)
 
   // Hazards
   val raw_hazard_pre = mesh.io.tags_in_progress.map { t =>
@@ -239,7 +264,7 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
     val is_garbage = addr1.is_garbage() || addr2.is_garbage() ||
       !start_inputting1 || !start_inputting2
 
-    val is_being_im2colled = can_be_im2colled.B && im2col_wire && im2col_en//im2col_wire
+    val is_being_im2colled = can_be_im2colled.B && im2col_wire//!im2col_wire && im2col_en
 
     !is_garbage && !is_being_im2colled && ((addr1_read_from_acc && addr2_read_from_acc) ||
       (!addr1_read_from_acc && !addr2_read_from_acc && addr1.sp_bank() === addr2.sp_bank()))
@@ -326,6 +351,22 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
     }
   }
 
+  //Seah: for WS propagate unenable
+  when(current_dataflow =/= Dataflow.WS.id.U){
+    prop := in_prop
+  }.otherwise{
+    when(!start_inputting_d) {
+      when(cntl.perform_single_mul && mesh.io.a.valid) {
+        prop_lock := true.B
+        prop := false.B
+      }.elsewhen(!prop_lock) {
+        prop := in_prop
+      }
+    }.otherwise{ // reset propagate signal
+      prop_lock:= false.B
+      prop := in_prop
+    }
+  }
 
   //Seah: for OS counter address sync
   val counter_save = WireInit(b_fire_counter)
@@ -341,7 +382,7 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
 
   // Scratchpad reads
   for (i <- 0 until sp_banks) {
-    val read_a = a_valid && !a_read_from_acc && dataAbank === i.U && start_inputting_a && !multiply_garbage && a_row_is_not_all_zeros && !(im2col_wire&&im2col_en)
+    val read_a = a_valid && !a_read_from_acc && dataAbank === i.U && start_inputting_a && !multiply_garbage && a_row_is_not_all_zeros && !im2col_wire
     val read_b = b_valid && !b_read_from_acc && dataBbank === i.U && start_inputting_b && !accumulate_zeros && b_row_is_not_all_zeros //&& !im2col_wire
     val read_d = d_valid && !d_read_from_acc && dataDbank === i.U && start_inputting_d && !preload_zeros && d_row_is_not_all_zeros //&& !im2col_wire
 
@@ -364,7 +405,7 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
 
   // Accumulator read
   for (i <- 0 until acc_banks) {
-    val read_a_from_acc = a_valid && a_read_from_acc && dataABankAcc === i.U && start_inputting_a && !multiply_garbage && a_row_is_not_all_zeros && !(im2col_wire&&im2col_en)
+    val read_a_from_acc = a_valid && a_read_from_acc && dataABankAcc === i.U && start_inputting_a && !multiply_garbage && a_row_is_not_all_zeros && !im2col_wire
     val read_b_from_acc = b_valid && b_read_from_acc && dataBBankAcc === i.U && start_inputting_b && !accumulate_zeros && b_row_is_not_all_zeros //&& !im2col_wire
     val read_d_from_acc = d_valid && d_read_from_acc && dataDBankAcc === i.U && start_inputting_d && !preload_zeros && d_row_is_not_all_zeros //&& !im2col_wire
 
@@ -389,7 +430,7 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
 
   // Im2Col reads
   {
-    val read_a = a_valid && start_inputting_a && !multiply_garbage && im2col_wire&&im2col_en //or just im2col_wire
+    val read_a = a_valid && start_inputting_a && !multiply_garbage && im2col_wire
 
     when (read_a && !io.im2col.req.ready) {
       a_ready := false.B
@@ -399,25 +440,22 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
 
     io.im2col.req.valid := read_a
     io.im2col.req.bits.addr := a_address_rs1
-    io.im2col.req.bits.icol := icol
-    io.im2col.req.bits.irow := irow
-    io.im2col.req.bits.ocol := ocol
-    io.im2col.req.bits.stride := weight_stride
-    io.im2col.req.bits.krow := krow
-    io.im2col.req.bits.kdim2 := kdim2
-    io.im2col.req.bits.row_turn := row_turn
-    io.im2col.req.bits.row_left := row_left
+    io.im2col.req.bits.fire_counter := a_fire_counter
+    io.im2col.req.bits.input_width := input_width
+    io.im2col.req.bits.output_width := output_width
+    io.im2col.req.bits.weight_stride := weight_stride
+    io.im2col.req.bits.weight_width := weight_width
     io.im2col.req.bits.channel := channel
     io.im2col.req.bits.im2col_cmd := im2col_en
     io.im2col.req.bits.start_inputting := start_inputting_a
+    io.im2col.req.bits.turn := im2col_turn
+    io.im2col.req.bits.ch_per_turn := channel_turn
+    io.im2col.req.bits.row_turn := row_turn
 
     io.im2col.resp.ready := mesh.io.a.ready
   }
-
-  //val turn_counter = RegInit(0.U(9.W))
-  //val turn_set = RegInit(false.B)
-
-  //when stride = 0, im2col disenable
+  val turn_counter = RegInit(0.U(9.W))
+  val turn_set = RegInit(false.B)
 
   // FSM logic
   switch (control_state) {
@@ -433,16 +471,15 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
         when(DoConfig && !matmul_in_progress && !pending_completed_rob_ids.map(_.valid).reduce(_ || _)) { // see config command from ROB
           activation := rs1s(0)(4, 3)
           in_shift := rs2s(0)(31, 0) // TODO magic number
-          acc_shift := cmd.bits(0).cmd.rs1(41, 32) // TODO magic number
-          relu6_shift := cmd.bits(0).cmd.rs2(41, 32) // TODO magic number
+          acc_shift := cmd.bits(0).cmd.rs1(xLen-1, 32) // TODO magic number
+          relu6_shift := cmd.bits(0).cmd.rs2(xLen-1, 32) // TODO magic number
 
-          ocol := cmd.bits(0).cmd.rs2(63, 56)
-          kdim2 := cmd.bits(0).cmd.rs2(55, 50)
-          krow := cmd.bits(0).cmd.rs2(49, 47)
-          channel := cmd.bits(0).cmd.rs2(31, 25)
+          im2col_en := cmd.bits(0).cmd.rs1(31)
+          //im2col_turn := cmd.bits(0).cmd.rs1(30, 22) //how many 16x16 im2colled block?
+          output_width := cmd.bits(0).cmd.rs1(21, 12) //output_width instead
+          weight_width := cmd.bits(0).cmd.rs2(28, 25) //why (0)??
+          channel := cmd.bits(0).cmd.rs2(21, 12)
           weight_stride := cmd.bits(0).cmd.rs2(24, 22)
-          row_left := cmd.bits(0).cmd.rs1(57, 54)
-          row_turn := cmd.bits(0).cmd.rs1(53, 42)
 
 
           if (dataflow == Dataflow.BOTH)
@@ -453,7 +490,7 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
 
           cmd.pop := 1.U
 
-          //turn_set := true.B //Seah: added for initializing turn counter
+          turn_set := true.B //Seah: added for initializing turn counter
         }
 
           // Preload
@@ -502,8 +539,9 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
     is (compute) {
       // Only preloading
       when(perform_single_preload) {
-        //turn_set := false.B
-        //row_turn_counter := row_turn // +1??
+        //turn_counter := im2col_turn - 1.U
+        turn_set := false.B
+        row_turn_counter := row_turn // +1??
         start_inputting_a := current_dataflow === Dataflow.OS.id.U
         start_inputting_d := true.B
 
@@ -655,10 +693,10 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
   mesh_cntl_signals_q.io.enq.bits.rob_id.bits := cmd.bits(preload_cmd_place).rob_id
 
   mesh_cntl_signals_q.io.enq.bits.dataflow := current_dataflow
-  mesh_cntl_signals_q.io.enq.bits.prop := Mux(performing_single_preload, in_prop_flush, in_prop)//prop) //available propagate or not?
+  mesh_cntl_signals_q.io.enq.bits.prop := Mux(performing_single_preload, in_prop_flush, prop)//in_prop)
   mesh_cntl_signals_q.io.enq.bits.shift := in_shift
 
-  mesh_cntl_signals_q.io.enq.bits.im2colling := im2col_wire && im2col_en //im2col_wire
+  mesh_cntl_signals_q.io.enq.bits.im2colling := im2col_wire
 
   val readData = VecInit(io.srams.read.map(_.resp.bits.data))
   val accReadData = VecInit(io.acc.read.map(_.resp.bits.data.asUInt()))
@@ -741,15 +779,15 @@ class ExecuteController[T <: Data, U <: Data](xLen: Int, tagWidth: Int, config: 
       mesh.io.tag_in.bits.cols := overlap_ws.cols
       mesh.io.tag_in.bits.rows := overlap_ws.rows
     }.otherwise{mesh.io.tag_in.bits.addr.make_this_garbage()} //Seah: when statement added (original: only make this garbage)
-  */
-}
+    */
+  }
 
-// Scratchpad writes
-val w_address = mesh.io.tag_out.addr
-val write_to_acc = w_address.is_acc_addr
+  // Scratchpad writes
+  val w_address = mesh.io.tag_out.addr
+  val write_to_acc = w_address.is_acc_addr
 
-val w_bank = Mux(write_to_acc, w_address.acc_bank(), w_address.sp_bank())
-val w_row = Mux(write_to_acc, w_address.acc_row(), w_address.sp_row())
+  val w_bank = Mux(write_to_acc, w_address.acc_bank(), w_address.sp_bank())
+  val w_row = Mux(write_to_acc, w_address.acc_row(), w_address.sp_row())
 
   val output_counter = new Counter(block_size)
 
@@ -784,72 +822,179 @@ val w_row = Mux(write_to_acc, w_address.acc_row(), w_address.sp_row())
   }
 
   //Seah: initializing turn counter for accumulator turn
-/*
-when(turn_set){
-  turn_counter := im2col_turn - 1.U
-}
+
+  when(turn_set){
+    turn_counter := im2col_turn - 1.U
+  }
+  /*
+ .elsewhen(is_garbage_addr){
+   turn_counter := im2col_turn - 1.U
+ }
+ */
+  //added for accumulator enable signal
+  val acc_write_en_counter = RegInit(0.U(log2Up(block_size*block_size*block_size).W))
+
+  // Write to accumulator
+  for (i <- 0 until acc_banks) {
+    when(io.acc.write(i).en){
+      acc_write_en_counter := wrappingAdd(acc_write_en_counter, 1.U, block_size.U*im2col_turn)
+    }
+    io.acc.write(i).en := start_array_outputting && w_bank === i.U && write_to_acc && !is_garbage_addr && write_this_row
+    io.acc.write(i).addr := current_w_bank_address
+    io.acc.write(i).data := mesh.io.out.bits
+    io.acc.write(i).acc := w_address.accumulate
+
+    when(im2col_turn > 1.U) { //Seah: added for WS accumulator
+      //when(turn_counter + 1.U < im2col_turn){
+      when(acc_write_en_counter > block_size.U - 1.U){
+        io.acc.write(i).acc := true.B //adding things
+      }.otherwise{
+        io.acc.write(i).acc := w_address.accumulate
+      }
+    }
+
+    // io.acc.write(i).mask := VecInit(Seq.fill(io.acc.write(0).mask.length)(true.B))
+    io.acc.write(i).mask := w_mask.flatMap(b => Seq.fill(accType.getWidth / (aligned_to * 8))(b))
+  }
+
+  // Handle dependencies and turn off outputs for garbage addresses
+  val mesh_completed_rob_id_fire = WireInit(false.B)
+  //val complete_lock = RegInit(false.B)
+
+  //Seah: added for WS accumulator
+  when(mesh.io.out.fire() && mesh.io.tag_out.rob_id.valid) {
+    //when(current_dataflow === Dataflow.WS.id.U) {
+      when(output_counter.inc()) {
+        mesh_completed_rob_id_fire := true.B
+        io.completed.valid := true.B
+        io.completed.bits := mesh.io.tag_out.rob_id.bits
+        //complete_lock := true.B
+        /*
+        when(im2col_turn === 1.U){
+          mesh_completed_rob_id_fire := true.B
+          io.completed.valid := true.B
+          io.completed.bits := mesh.io.tag_out.rob_id.bits
+        }.otherwise{
+          when(io.im2col.resp.bits.row_turn === row_turn){ // last gemmini_compute
+            when(turn_counter =/= 0.U){
+              turn_counter := turn_counter - 1.U
+            }.otherwise {
+              when(io.im2col.resp.bits.im2col_turn === 0.U) { //very last turn
+                mesh_completed_rob_id_fire := true.B
+                io.completed.valid := true.B
+                io.completed.bits := mesh.io.tag_out.rob_id.bits
+              }
+            }
+          }.otherwise{ //not for last computation
+            when(turn_counter === 1.U){
+              turn_counter := turn_counter - 1.U
+              mesh_completed_rob_id_fire := true.B
+              io.completed.valid := true.B
+              io.completed.bits := mesh.io.tag_out.rob_id.bits
+            }.elsewhen(turn_counter =/= 0.U){
+              turn_counter := turn_counter - 1.U
+            }
+          }
+        }
 */
+        /*
+        when(turn_counter === 0.U || turn_counter === 1.U){
+          when(!complete_lock){
+            mesh_completed_rob_id_fire := true.B
+            io.completed.valid := true.B
+            io.completed.bits := mesh.io.tag_out.rob_id.bits
+            complete_lock := true.B
+          }
+        }
 
-//added for accumulator enable signal
-//val acc_write_en_counter = RegInit(0.U(log2Up(block_size*block_size*block_size).W))
-
-// Write to accumulator
-for (i <- 0 until acc_banks) {
-  /*
-  when(io.acc.write(i).en){
-    acc_write_en_counter := wrappingAdd(acc_write_en_counter, 1.U, block_size.U*im2col_turn)
-  }
-   */
-  io.acc.write(i).en := start_array_outputting && w_bank === i.U && write_to_acc && !is_garbage_addr && write_this_row
-  io.acc.write(i).addr := current_w_bank_address
-  io.acc.write(i).data := mesh.io.out.bits
-  io.acc.write(i).acc := w_address.accumulate
-
-  /*
-  when(im2col_turn > 1.U) { //Seah: added for WS accumulator
-    //when(turn_counter + 1.U < im2col_turn){
-    when(acc_write_en_counter > block_size.U - 1.U){
-      io.acc.write(i).acc := true.B //adding things
-    }.otherwise{
-      io.acc.write(i).acc := w_address.accumulate
+ */
+        /*
+        when(!complete_lock) {
+          when(turn_counter === im2col_turn - 1.U) {
+            mesh_completed_rob_id_fire := true.B
+            io.completed.valid := true.B
+            io.completed.bits := mesh.io.tag_out.rob_id.bits
+            complete_lock := true.B
+          }
+        }.otherwise {
+          complete_lock := false.B
+          when(turn_counter === 0.U) {
+            mesh_completed_rob_id_fire := true.B
+            io.completed.valid := true.B
+            io.completed.bits := mesh.io.tag_out.rob_id.bits
+            complete_lock := true.B
+          }.elsewhen(turn_counter === im2col_turn - 1.U){complete_lock := true.B}
+        }
+         */
+        /*
+      }
+    }.otherwise{ // OS - not yet
+      when(output_counter.inc()){
+        mesh_completed_rob_id_fire := true.B
+        io.completed.valid := true.B
+        io.completed.bits := mesh.io.tag_out.rob_id.bits
+      }
     }
+
+ */
+      }
+    start_array_outputting :=  !is_garbage_addr
   }
-  */
 
-  io.acc.write(i).mask := w_mask.flatMap(b => Seq.fill(accType.getWidth / (aligned_to * 8))(b))
-}
 
-// Handle dependencies and turn off outputs for garbage addresses
-val mesh_completed_rob_id_fire = WireInit(false.B)
-//val complete_lock = RegInit(false.B)
+  when(io.im2col.resp.bits.im2col_end_reg && turn_counter =/= 0.U){
+    turn_counter := turn_counter - 1.U
+  }.elsewhen(performing_single_preload && turn_counter === 0.U ){//&& io.im2col.resp.bits.row_turn =/= row_turn){ //end of block: turn_counter stay at 0
+    turn_counter := im2col_turn - 1.U
+    //complete_lock := false.B
+  }
 
-//Seah: added for WS accumulator
-when(mesh.io.out.fire() && mesh.io.tag_out.rob_id.valid) {
-  //when(current_dataflow === Dataflow.WS.id.U) {
-    when(output_counter.inc()) {
-      mesh_completed_rob_id_fire := true.B
+
+  when (!mesh_completed_rob_id_fire) {
+    when(pending_completed_rob_ids(0).valid) {
       io.completed.valid := true.B
-      io.completed.bits := mesh.io.tag_out.rob_id.bits
-
+      io.completed.bits := pending_completed_rob_ids(0).pop()
+    }.elsewhen(pending_completed_rob_ids(1).valid) {
+      io.completed.valid := true.B
+      io.completed.bits := pending_completed_rob_ids(1).pop()
     }
-  start_array_outputting :=  !is_garbage_addr
-}
-
-
-when (!mesh_completed_rob_id_fire) {
-  when(pending_completed_rob_ids(0).valid) {
-    io.completed.valid := true.B
-    io.completed.bits := pending_completed_rob_ids(0).pop()
-  }.elsewhen(pending_completed_rob_ids(1).valid) {
-    io.completed.valid := true.B
-    io.completed.bits := pending_completed_rob_ids(1).pop()
   }
-}
 
 
+  /*
+          when(turn_counter =/= 0.U) {
+            turn_counter := turn_counter - 1.U
+          }.otherwise { //when everything is finished
+            mesh_completed_rob_id_fire := true.B
+            io.completed.valid := true.B
+            io.completed.bits := mesh.io.tag_out.rob_id.bits
+          }
+        }
+      }.otherwise{ // OS - not yet
+        when(output_counter.inc()){
+          mesh_completed_rob_id_fire := true.B
+          io.completed.valid := true.B
+          io.completed.bits := mesh.io.tag_out.rob_id.bits
+        }
+      }
+      start_array_outputting :=  !is_garbage_addr
+    }
+    when (!mesh_completed_rob_id_fire) {
+      // when(io.im2col.resp.bits.im2col_turn === 0.U) { //Seah: added for same reason
+      when(turn_counter === 0.U){
+        when(pending_completed_rob_ids(0).valid) {
+          io.completed.valid := true.B
+          io.completed.bits := pending_completed_rob_ids(0).pop()
+        }.elsewhen(pending_completed_rob_ids(1).valid) {
+          io.completed.valid := true.B
+          io.completed.bits := pending_completed_rob_ids(1).pop()
+        }
+      }
+    }
+   */
 
-when (reset.toBool()) {
-  // pending_completed_rob_id.valid := false.B
-  pending_completed_rob_ids.foreach(_.valid := false.B)
-}
+  when (reset.toBool()) {
+    // pending_completed_rob_id.valid := false.B
+    pending_completed_rob_ids.foreach(_.valid := false.B)
+  }
 }
